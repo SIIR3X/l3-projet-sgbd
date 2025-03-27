@@ -1,0 +1,714 @@
+-- Base de donnée : orcl2
+-- User : fagioli7u
+
+-- Suppression des séquences (si elles existent)
+DROP SEQUENCE seqProjet;
+
+-- Suppression des triggers (si ils existent)
+DROP TRIGGER EmployeAvantInsertion;
+DROP TRIGGER MaterielAvantInsertion;
+DROP TRIGGER ProjetAvantInsertion;
+DROP TRIGGER ProjetUpdate;
+DROP TRIGGER ParticiperAvantInsertion;
+DROP TRIGGER ParticiperUpdateQuotite;
+DROP TRIGGER ParticiperUpdateDate;
+DROP TRIGGER ParticiperDelete;
+DROP TRIGGER UtiliserAvantInsertion;
+DROP TRIGGER UtiliserUpdate;
+
+-- Suppression des tables (si elles existent)
+DROP TABLE Utiliser CASCADE CONSTRAINTS;
+DROP TABLE Materiel CASCADE CONSTRAINTS;
+DROP TABLE Participer CASCADE CONSTRAINTS;
+DROP TABLE Projet CASCADE CONSTRAINTS;
+DROP TABLE CoutMensuelEmploye CASCADE CONSTRAINTS;
+DROP TABLE Employe CASCADE CONSTRAINTS;
+
+-- Suppression des fonctions (si elles existent)
+DROP FUNCTION CalculerCoutEmpProjet;
+DROP FUNCTION CalculerCoutMensuel;
+DROP PROCEDURE MettreAJourCoutMensuelEmploye;
+
+
+-- Séquence pour la table 'Projet'
+CREATE SEQUENCE seqProjet START WITH 1 INCREMENT BY 1;
+
+
+-- CREATION DES TABLES
+
+-- Table 'Employe'
+CREATE TABLE Employe (
+    Matricule NUMBER PRIMARY KEY,
+    Nom VARCHAR2(50) NOT NULL,
+    Fonction VARCHAR2(50) NOT NULL,
+    CoutJour NUMBER(5,2) NOT NULL CHECK(CoutJour > 0)
+);
+
+-- Table 'CoutMensuelEmploye'
+CREATE TABLE CoutMensuelEmploye (
+    Matricule NUMBER NOT NULL REFERENCES Employe(Matricule),
+    Mois CHAR(7) NOT NULL,
+    CoutMensuel NUMBER(10,2) NOT NULL CHECK(CoutMensuel >= 0),
+    PRIMARY KEY (Matricule, Mois)
+);
+
+-- Table 'Projet'
+CREATE TABLE Projet (
+    IdProj VARCHAR2(10) PRIMARY KEY,
+    DateDebutProj DATE NOT NULL,
+    DateFinProj DATE NOT NULL,
+    Budget NUMBER(10,2) NOT NULL CHECK(Budget > 0),
+    CoutEmp NUMBER(10,2) DEFAULT 0 CHECK(CoutEmp >= 0),
+    CoutMat NUMBER(10,2) DEFAULT 0 CHECK(CoutMat >= 0),
+    RespProj NUMBER NOT NULL REFERENCES Employe(Matricule),
+    CHECK (DateDebutProj <= DateFinProj)
+);
+
+-- Table 'Participer
+CREATE TABLE Participer (
+    Matricule NUMBER NOT NULL REFERENCES Employe(Matricule),
+    IdProj VARCHAR2(10) NOT NULL REFERENCES Projet(IdProj),
+    DateDebut DATE NOT NULL,
+    DateFin DATE NOT NULL,
+    Quotite NUMBER(5,2) NOT NULL CHECK(Quotite >= 0 AND Quotite <= 100),
+    PRIMARY KEY (Matricule, IdProj, DateDebut),
+    CHECK (DateDebut <= DateFin)
+);
+
+-- Table 'Materiel'
+CREATE TABLE Materiel (
+    CodeMat VARCHAR2(10) PRIMARY KEY,
+    TypeMateriel VARCHAR2(50) NOT NULL,
+    CoutHoraire NUMBER(5,2) NOT NULL CHECK(CoutHoraire > 0),
+    NbHeurUtilisation NUMBER(10,2) DEFAULT 0
+);
+
+-- Table 'Utiliser'
+CREATE TABLE Utiliser (
+    CodeMat VARCHAR2(10) NOT NULL REFERENCES Materiel(CodeMat),
+    DateUtilisation DATE NOT NULL,
+    IdProj VARCHAR2(10) NOT NULL REFERENCES Projet(IdProj),
+    CoutHoraire NUMBER(5,2) DEFAULT 0 CHECK(CoutHoraire >= 0),
+    NbHeures NUMBER(10,2) NOT NULL,
+    PRIMARY KEY (CodeMat, DateUtilisation, IdProj),
+    CHECK (NbHeures > 0 AND NbHeures <= 24)
+);
+
+
+-- CREATION DES FONCTIONS
+
+-- Fonction pour calculer le coût total de l'employé sur un projet
+CREATE OR REPLACE FUNCTION CalculerCoutEmpProjet(
+    p_IdProj Projet.IdProj%TYPE
+) RETURN NUMBER IS
+    v_CoutEmp Projet.CoutEmp%TYPE;
+BEGIN
+    SELECT COALESCE(SUM(CoutJour * (((DateFin - DateDebut) + 1) * Quotite/100)), 0) INTO v_CoutEmp
+    FROM Participer P, Employe E
+    WHERE P.Matricule = E.Matricule AND IdProj = p_IdProj;
+
+    RETURN v_CoutEmp;
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN 0;
+END;
+/
+
+-- Fonction pour calculer le cout mensuel d'un employé
+CREATE OR REPLACE FUNCTION CalculerCoutMensuel(
+    p_Matricule IN Employe.Matricule%TYPE,
+    p_Mois IN VARCHAR2
+) RETURN NUMBER
+IS
+    v_Debut    DATE;
+    v_Fin      DATE;
+    v_NbJours  NUMBER;
+    v_CoutJour Employe.CoutJour%TYPE;
+    v_Cout     NUMBER;
+BEGIN
+    v_Debut := TO_DATE(p_Mois || '-01', 'YYYY-MM-DD');
+    v_Fin := LAST_DAY(v_Debut);
+
+    SELECT CoutJour INTO v_CoutJour
+    FROM Employe
+    WHERE Matricule = p_Matricule;
+
+    SELECT NVL(SUM(LEAST(v_Fin, DateFin) - GREATEST(v_Debut, DateDebut) + 1), 0) INTO v_NbJours
+    FROM Participer
+    WHERE Matricule = p_Matricule AND DateDebut <= v_Fin AND DateFin >= v_Debut;
+
+    IF v_NbJours < 0 THEN
+       RAISE_APPLICATION_ERROR(-20020, 'Nombre de jours négatif calculé pour le matricule ' || p_Matricule);
+    END IF;
+
+    v_Cout := v_CoutJour * v_NbJours;
+
+    IF v_Cout < 0 THEN
+       RAISE_APPLICATION_ERROR(-20021, 'Coût mensuel négatif calculé pour le matricule ' || p_Matricule);
+    END IF;
+
+    RETURN v_Cout;
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR(-20010, 'Erreur dans CalculerCoutMensuel: ' || SQLERRM);
+END;
+/
+
+-- Procédure pour calculer le cout mensuel de l'employé
+CREATE OR REPLACE PROCEDURE MettreAJourCoutMensuelEmploye(
+    p_Matricule IN Employe.Matricule%TYPE
+) IS
+    v_Min DATE;
+    v_Max DATE;
+    v_MoisCourant DATE;
+    v_Cout NUMBER;
+BEGIN
+    -- On récupère la date de début la plus ancienne et la date de fin la plus récente
+    SELECT MIN(DateDebut), MAX(DateFin) INTO v_Min, v_Max
+    FROM Participer
+    WHERE Matricule = p_Matricule;
+      
+    -- S'il n'y a aucune participation, on ne fait rien
+    IF v_Min IS NULL THEN
+        RETURN;
+    END IF;
+    
+    -- On définit le premier mois à traiter (début du mois de la plus ancienne participation)
+    v_MoisCourant := TRUNC(v_Min, 'MM');
+    
+    -- Boucler sur tous les mois entre le premier mois et le dernier mois concerné
+
+    -- On boucle sur tous les mois entre le premier mois et le dernier mois concerné
+    WHILE v_MoisCourant <= v_Max LOOP
+        -- On calcule le coût mensuel de l'employé pour le mois courant
+        v_Cout := CalculerCoutMensuel(p_Matricule, TO_CHAR(v_MoisCourant, 'YYYY-MM'));
+        
+        BEGIN
+            UPDATE CoutMensuelEmploye
+            SET CoutMensuel = v_Cout
+            WHERE Matricule = p_Matricule AND Mois = TO_CHAR(v_MoisCourant, 'YYYY-MM');
+    
+            IF SQL%ROWCOUNT = 0 THEN
+                INSERT INTO CoutMensuelEmploye (Matricule, Mois, CoutMensuel)
+                VALUES (p_Matricule, TO_CHAR(v_MoisCourant, 'YYYY-MM'), v_Cout);
+            END IF;
+        EXCEPTION
+            WHEN OTHERS THEN
+                RAISE_APPLICATION_ERROR(-20001, 'Erreur lors de la mise à jour/insertion pour le mois ' || TO_CHAR(v_MoisCourant, 'YYYY-MM') || ' : ' || SQLERRM);
+        END;
+        
+        -- On passe au mois suivant
+        v_MoisCourant := ADD_MONTHS(v_MoisCourant, 1);
+    END LOOP;
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Aucune participation trouvée pour cet employé.');
+    WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR(-20003, 'Erreur lors de la mise à jour du coût mensuel : ' || SQLERRM);
+END;
+/
+
+
+-- CREATION DES TRIGGERS
+
+-- Trigger avant insertion dans la table 'Employe'
+-- Actions :
+-- Vérifier que le coût journalier de l'employé est supérieur à 0 (Contrainte définie dans la création de la table)
+CREATE OR REPLACE TRIGGER EmployeAvantInsertion
+BEFORE INSERT ON Employe
+FOR EACH ROW
+DECLARE
+    -- Exceptions
+    e_cout_jour_invalide EXCEPTION;
+BEGIN
+    -- On vérifie que le coût journalier de l'employé est supérieur à 0
+    IF :NEW.CoutJour = 0 THEN
+        RAISE e_cout_jour_invalide;
+    END IF;
+EXCEPTION
+    WHEN e_cout_jour_invalide THEN
+        RAISE_APPLICATION_ERROR(-20001, 'Erreur : Le coût journalier de l''employé est invalide.');
+    WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Erreur inconnue.');
+END;
+/
+
+-- Trigger avant insertion dans la table 'Projet'
+-- Actions :
+-- Vérifier que le cout horaire du matériel est supérieur à 0 (Contrainte également définie dans la création de la table)
+CREATE OR REPLACE TRIGGER MaterielAvantInsertion
+BEFORE INSERT ON Materiel
+FOR EACH ROW
+DECLARE
+    -- Exceptions
+    e_cout_horaire_invalide EXCEPTION;
+BEGIN
+    -- On vérifie que le cout horaire du matériel est supérieur à 0
+    IF :NEW.CoutHoraire = 0 THEN
+        RAISE e_cout_horaire_invalide;
+    END IF;
+EXCEPTION
+    WHEN e_cout_horaire_invalide THEN
+        RAISE_APPLICATION_ERROR(-20001, 'Erreur : Le coût horaire du matériel est invalide.');
+    WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Erreur inconnue.');
+END;
+/
+
+-- Trigger avant insertion dans la table 'Projet' (n°7)
+-- Actions :
+-- Vérifier que le responsable du projet existe
+-- Générer un identifiant de projet automatiquement
+CREATE OR REPLACE TRIGGER ProjetAvantInsertion
+BEFORE INSERT ON Projet
+FOR EACH ROW
+DECLARE
+    -- Variables
+    v_Exist Projet.RespProj%TYPE;
+
+    -- Exceptions
+    e_responsable_inexistant EXCEPTION;
+BEGIN
+    -- On récupère le responsable du projet
+    SELECT COUNT(*) INTO v_Exist
+    FROM Employe
+    WHERE Matricule = :NEW.RespProj;
+
+    -- On vérifie que le responsable du projet existe
+    IF v_Exist = 0 THEN
+        RAISE e_responsable_inexistant;
+    END IF;
+
+    -- On génère un identifiant de projet automatiquement    
+    IF :NEW.IdProj IS NULL THEN
+        :NEW.IdProj := 'P' || seqProjet.NEXTVAL;
+    END IF;
+EXCEPTION
+    WHEN e_responsable_inexistant THEN
+        RAISE_APPLICATION_ERROR(-20001, 'Erreur : Le responsable du projet est inexistant.');
+    WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Erreur inconnue.');
+END;
+/
+
+-- Trigger après insertion ou mise à jour dans la table 'Projet' (n°4)
+-- Actions :
+-- Vérifier que le coût total du projet ne dépasse pas le budget
+CREATE OR REPLACE TRIGGER ProjetUpdate
+AFTER INSERT OR UPDATE ON Projet
+FOR EACH ROW
+DECLARE
+    -- Variables
+    v_Nom Employe.Nom%TYPE;
+BEGIN
+    -- On vériie que le coût total du projet ne dépasse pas le budget
+    IF (:NEW.CoutEmp + :NEW.CoutMat) > :NEW.Budget THEN
+        -- Si le budget est dépassé, on récupère le nom du responsable du projet
+        SELECT Nom INTO v_Nom
+        FROM Employe
+        WHERE Matricule = :NEW.RespProj;
+
+        -- Et on lève une exception
+        RAISE_APPLICATION_ERROR(-20001,
+          'Alerte : Budget depasse pour le projet ' || :NEW.IdProj ||
+          '. Nom : ' || v_Nom ||
+          '. CoutEmp : ' || :NEW.CoutEmp ||
+          ', CoutMat : ' || :NEW.CoutMat ||
+          ', Budget : ' || :NEW.Budget);
+    END IF;
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Erreur inconnue.');
+END;
+/
+
+-- TRIGGER SUR LA TABLE 'Participer'
+
+-- Trigger avant insertion dans la table 'Participer' (n°1, n°3)
+-- Actions :
+-- Vérifier que la date de début de participation est antérieure à la date de fin de participation (Contrainte également définie dans la création de la table)
+-- Vérifier que la date de début de participation est comprise entre la date de début et la date de fin du projet
+-- Vérifier que la quotité de participation ne dépasse pas 100% (Contrainte également définie dans la création de la table)
+-- Vérifier que la somme des quotités de participation de l'employé sur le projet ne dépasse pas 100%
+-- Mettre à jour le coût total de l'employé sur le projet
+CREATE OR REPLACE TRIGGER ParticiperAvantInsertion
+BEFORE INSERT ON Participer
+FOR EACH ROW
+DECLARE
+    -- Variables
+    v_DateDebutProj Projet.DateDebutProj%TYPE;
+    v_DateFinProj Projet.DateFinProj%TYPE;
+    v_SommeQuotite Participer.Quotite%TYPE;
+    v_CoutEmp Projet.CoutEmp%TYPE;
+    v_CoutJour Employe.CoutJour%TYPE;
+    v_Nouveau_cout NUMBER(10,2);
+
+    -- Exceptions
+    e_date_non_valide EXCEPTION;
+    e_date_non_comprise_dans_projet EXCEPTION;
+    e_quotite_depassant_100 EXCEPTION;
+    e_somme_quotite_depassant_100 EXCEPTION;
+BEGIN
+    -- On vérifie que la date de début de participation est bien antérieure à la date de fin de participation
+    IF :NEW.DateDebut > :NEW.DateFin THEN
+        RAISE e_date_non_valide;
+    END IF;
+
+    -- On vérifie que la quotité de participation ne dépasse pas 100%
+    IF :NEW.Quotite > 100 THEN
+        RAISE e_quotite_depassant_100;
+    END IF;
+
+    -- On récupère les dates de début et de fin et le coût  de l'employé sur le projet
+    SELECT DateDebutProj, DateFinProj, CoutEmp INTO v_DateDebutProj, v_DateFinProj, v_CoutEmp
+    FROM Projet
+    WHERE IdProj = :NEW.IdProj;
+
+    -- On vérifie que la date de début de participation est bien comprise entre la date de début et la date de fin du projet
+    IF (:NEW.DateDebut < v_DateDebutProj) OR (:NEW.DateFin > v_DateFinProj) THEN
+        RAISE e_date_non_comprise_dans_projet;
+    END IF;
+
+    -- On récupère la somme des quotités de participation de l'employé sur le projet
+    SELECT COALESCE(SUM(Quotite), 0) INTO v_SommeQuotite
+    FROM Participer
+    WHERE Matricule = :NEW.Matricule AND (:NEW.DateDebut <= DateFin AND :NEW.DateFin >= DateDebut);
+
+    -- On vérifie que la somme des quotités de participation de l'employé sur le projet ne dépasse pas 100%
+    IF v_SommeQuotite + :NEW.Quotite > 100 THEN
+        RAISE e_somme_quotite_depassant_100;
+    END IF;
+
+    -- On récupère le coût journalier de l'employé
+    SELECT CoutJour INTO v_CoutJour
+    FROM Employe
+    WHERE Matricule = :NEW.Matricule;
+
+    -- On calcule le nouveau coût de l'employé sur le projet
+    v_Nouveau_cout := v_CoutJour * (((:NEW.DateFin - :NEW.DateDebut) + 1) * (:NEW.Quotite/100));
+
+    -- On met à jour le coût total de l'employé sur le projet
+    UPDATE Projet
+    SET CoutEmp = v_CoutEmp + v_Nouveau_cout
+    WHERE IdProj = :NEW.IdProj;
+
+    -- On met à jour le coût mensuel de l'employé
+    MettreAJourCoutMensuelEmploye(:NEW.Matricule);
+EXCEPTION
+    WHEN e_date_non_valide THEN
+        RAISE_APPLICATION_ERROR(-20001, 'Erreur : La date de début de participation doit être antérieure à la date de fin de participation.');
+    WHEN e_date_non_comprise_dans_projet THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Erreur : La date de début de participation doit être comprise entre la date de début et la date de fin du projet.');
+    WHEN e_quotite_depassant_100 THEN
+        RAISE_APPLICATION_ERROR(-20003, 'Erreur : La quotité de participation ne doit pas dépasser 100%.');
+    WHEN e_somme_quotite_depassant_100 THEN
+        RAISE_APPLICATION_ERROR(-20004, 'Erreur : La somme des quotités de participation ne doit pas dépasser 100%.');
+    WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR(-20005, 'Erreur inconnue.');
+END;
+/
+
+-- Trigger après mise à jour des quotités de participation dans la table 'Participer' (n°3)
+CREATE OR REPLACE TRIGGER ParticiperUpdateQuotite
+AFTER UPDATE OF Quotite ON Participer
+DECLARE
+    -- Variables
+    v_Total NUMBER;
+    v_Date  DATE;
+    v_DateDebut Participer.DateDebut%TYPE;
+    v_DateFin Participer.DateFin%TYPE;
+    v_Mois VARCHAR2(7) := TO_CHAR(SYSDATE, 'YYYY-MM');
+
+    -- Exceptions
+    e_quotite_depassant_100 EXCEPTION;
+BEGIN
+    -- On parcourt les employés de la table 'Participer'
+    FOR r IN (
+        SELECT DISTINCT Matricule 
+        FROM Participer
+    ) LOOP
+        -- On récupère les dates de début et de fin de participation de l'employé
+        SELECT MIN(DateDebut), MAX(DateFin) INTO v_DateDebut, v_DateFin
+        FROM Participer
+        WHERE Matricule = r.Matricule;
+        
+        v_Date := v_DateDebut;
+
+        -- Pour chaque jour de participation de l'employé
+        WHILE v_Date <= v_DateFin LOOP
+            -- On calcule la somme des quotités de participation de l'employé
+            SELECT NVL(SUM(Quotite), 0) INTO v_Total
+            FROM Participer
+            WHERE Matricule = r.Matricule AND v_Date BETWEEN DateDebut AND DateFin;
+            
+            -- On vérifie que la somme des quotités de participation de l'employé ne dépasse pas 100%
+            IF v_Total > 100 THEN
+                RAISE e_quotite_depassant_100;
+            END IF;
+            
+            -- Et on passe au jour suivant
+            v_Date := v_Date + 1;
+        END LOOP;
+    END LOOP;
+
+    -- Si tout est correct, on met à jour le coût total de l'employé sur le projet
+    FOR r IN (
+        SELECT DISTINCT IdProj
+        FROM Participer
+    ) LOOP
+        UPDATE Projet
+        SET CoutEmp = CalculerCoutEmpProjet(r.IdProj)
+        WHERE IdProj = r.IdProj;
+    END LOOP;
+
+    -- Et on met à jour le coût mensuel de l'employé
+    FOR r IN (SELECT DISTINCT Matricule
+        FROM Participer
+    ) LOOP
+        MettreAJourCoutMensuelEmploye(r.Matricule);
+    END LOOP;
+EXCEPTION
+    WHEN e_quotite_depassant_100 THEN
+        RAISE_APPLICATION_ERROR(-20001, 
+          'Erreur : La somme des quotités de participation ne doit pas dépasser 100%.');
+    WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Erreur inconnue.' || SQLERRM);
+END;
+/
+
+-- Trigger après mise à jour des dates de participation dans la table 'Participer'
+CREATE OR REPLACE TRIGGER ParticiperUpdateDate
+AFTER UPDATE OF DateDebut, DateFin ON Participer
+DECLARE
+    -- Variables
+    v_min DATE;
+    v_max DATE;
+    v_total NUMBER;
+    v_day DATE;
+    v_new_cout NUMBER;
+    v_count   NUMBER;
+
+    -- Exceptions
+    e_date_debut_superieure_date_fin EXCEPTION;
+    e_date_hors_projet EXCEPTION;
+    e_somme_quotite_depassant_100 EXCEPTION;
+BEGIN
+    -- On commence par vérifier que les dates de début sont bien antérieures aux dates de fin
+    SELECT COUNT(*) INTO v_count
+    FROM Participer
+    WHERE DateDebut > DateFin;
+
+    IF v_count > 0 THEN
+        RAISE e_date_debut_superieure_date_fin;
+    END IF;
+    
+    -- On vérifie ensuite que les dates de participation sont bien comprises dans la période du projet
+    FOR r IN (SELECT p.Matricule, p.IdProj, p.DateDebut, p.DateFin
+        FROM Participer p
+    ) LOOP
+        DECLARE
+            v_proj_deb DATE;
+            v_proj_fin DATE;
+        BEGIN
+            SELECT DateDebutProj, DateFinProj
+            INTO v_proj_deb, v_proj_fin
+            FROM Projet
+            WHERE IdProj = r.IdProj;
+             
+            IF (r.DateDebut < v_proj_deb) OR (r.DateFin > v_proj_fin) THEN
+                RAISE e_date_hors_projet;
+            END IF;
+        END;
+    END LOOP;
+    
+    -- On vérifie que la somme des quotités de participation ne dépasse pas 100% pour chaque employé
+    FOR r IN (SELECT DISTINCT Matricule 
+        FROM Participer
+    ) LOOP
+        SELECT MIN(DateDebut), MAX(DateFin)
+        INTO v_min, v_max
+        FROM Participer
+        WHERE Matricule = r.Matricule;
+
+        v_day := v_min;
+        WHILE v_day <= v_max LOOP
+            SELECT COALESCE(SUM(Quotite), 0)
+            INTO v_total
+            FROM Participer
+            WHERE Matricule = r.Matricule AND v_day BETWEEN DateDebut AND DateFin;
+            
+            IF v_total > 100 THEN
+                RAISE e_somme_quotite_depassant_100;
+            END IF;
+
+            v_day := v_day + 1;
+        END LOOP;
+    END LOOP;
+    
+    -- Pour finir on met à jour le coût total de l'employé sur le projet
+    FOR r IN (SELECT DISTINCT IdProj 
+        FROM Participer
+    ) LOOP
+        SELECT NVL(SUM((p.DateFin - p.DateDebut + 1) * e.CoutJour * (p.Quotite/100)), 0)
+        INTO v_new_cout
+        FROM Participer p
+        JOIN Employe e ON p.Matricule = e.Matricule
+        WHERE p.IdProj = r.IdProj;
+         
+        UPDATE Projet
+        SET CoutEmp = v_new_cout
+        WHERE IdProj = r.IdProj;
+    END LOOP;
+
+    -- Et on met à jour le coût mensuel de l'employé
+    FOR r IN (SELECT DISTINCT Matricule
+        FROM Participer
+    ) LOOP
+        MettreAJourCoutMensuelEmploye(r.Matricule);
+    END LOOP;
+
+EXCEPTION
+    WHEN e_date_debut_superieure_date_fin THEN
+        RAISE_APPLICATION_ERROR(-20003, 'Erreur : La date de début de participation doit être antérieure à la date de fin de participation.');
+    WHEN e_date_hors_projet THEN
+        RAISE_APPLICATION_ERROR(-20004, 'Erreur : La date de participation doit être comprise entre la date de début et la date de fin du projet.');
+    WHEN e_somme_quotite_depassant_100 THEN
+        RAISE_APPLICATION_ERROR(-20005, 'Erreur : La somme des quotités de participation ne doit pas dépasser 100%.');
+    WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR(-20004, 'Erreur inconnue dans le trigger statement-level ParticiperUpdateStmt.');
+END;
+/
+
+CREATE OR REPLACE TRIGGER ParticiperDelete
+AFTER DELETE ON Participer
+DECLARE
+    v_new_cout NUMBER(10,2);
+BEGIN
+    -- On met à jour le coût total de chaque employé sur le projet
+    FOR r IN (SELECT DISTINCT IdProj 
+        FROM Participer
+    ) LOOP
+        SELECT NVL(SUM((p.DateFin - p.DateDebut + 1) * e.CoutJour * (p.Quotite/100)), 0)
+        INTO v_new_cout
+        FROM Participer p
+        JOIN Employe e ON p.Matricule = e.Matricule
+        WHERE p.IdProj = r.IdProj;
+         
+        UPDATE Projet
+        SET CoutEmp = v_new_cout
+        WHERE IdProj = r.IdProj;
+    END LOOP;
+    
+    -- Pour les projets qui ne possèdent plus aucune participation, on met le coût à 0.
+    UPDATE Projet
+    SET CoutEmp = 0
+    WHERE IdProj NOT IN (SELECT DISTINCT IdProj FROM Participer);
+     
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR(-20005, 'Erreur dans le trigger ParticiperDelete.');
+END;
+/
+
+-- TRIGGER SUR LA TABLE 'Utiliser'
+
+-- Trigger avant insertion dans la table 'Utiliser' (n°2, n°3, n°5)
+-- Actions :
+-- Vérifier que la date d'utilisation est comprise entre la date de début et la date de fin du projet
+-- Vérifier que le nombre d'heures d'utilisation est compris entre 0 et 24 (Contrainte également définie dans la création de la table)
+-- Vérifier que le coût total du projet ne dépasse pas le budget
+-- Mettre à jour le coût matériel du projet
+CREATE OR REPLACE TRIGGER UtiliserAvantInsertion
+BEFORE INSERT ON Utiliser
+FOR EACH ROW
+DECLARE
+    -- Variables
+    v_DateDebutProj Projet.DateDebutProj%TYPE;
+    v_DateFinProj Projet.DateFinProj%TYPE;
+    v_Budget Projet.Budget%TYPE;
+    v_CoutMat Projet.CoutMat%TYPE;
+    v_CoutEmp Projet.CoutEmp%TYPE;
+    v_CoutMatTotal Projet.CoutMat%TYPE;
+
+    -- Exceptions
+    e_date_utilisation_hors_projet EXCEPTION;
+    e_nb_heures_invalide EXCEPTION;
+    e_budget_depasse EXCEPTION;
+BEGIN
+    -- On récupère les informations du projet
+    SELECT DateDebutProj, DateFinProj, Budget, CoutMat, CoutEmp INTO v_DateDebutProj, v_DateFinProj, v_Budget, v_CoutMat, v_CoutEmp
+    FROM Projet
+    WHERE IdProj = :NEW.IdProj;
+
+    -- On vériie que la date d'utilisation est bien comprise entre la date de début et la date de fin du projet
+    IF :NEW.DateUtilisation < v_DateDebutProj OR :NEW.DateUtilisation > v_DateFinProj THEN
+        RAISE e_date_utilisation_hors_projet;
+    END IF;
+
+    -- On vérifie que le nombre d'heures d'utilisation est compris entre 0 et 24
+    IF :NEW.NbHeures > 24 OR :NEW.NbHeures <= 0 THEN
+        RAISE e_nb_heures_invalide;
+    END IF;
+
+    -- On récupère le cout horaire du matériel
+    SELECT CoutHoraire INTO :NEW.CoutHoraire
+    FROM Materiel
+    WHERE CodeMat = :NEW.CodeMat;
+
+    -- On calcule le coût total du matériel
+    v_CoutMatTotal := :NEW.CoutHoraire * :NEW.NbHeures;
+
+    -- On vérifie que le coût total du projet ne dépasse pas le budget
+    IF (v_CoutEmp + v_CoutMat + v_CoutMatTotal) > v_Budget THEN
+        RAISE e_budget_depasse;
+    END IF;
+
+    -- On met à jour le coût matériel du projet
+    UPDATE Projet
+    SET CoutMat = v_CoutMat + v_CoutMatTotal
+    WHERE IdProj = :NEW.IdProj;
+
+    -- On met à jour le nombre d'heures d'utilisation du matériel
+    UPDATE Materiel
+    SET NbHeurUtilisation = NbHeurUtilisation + :NEW.NbHeures
+    WHERE CodeMat = :NEW.CodeMat;
+EXCEPTION
+    WHEN e_date_utilisation_hors_projet THEN
+        RAISE_APPLICATION_ERROR(-20001, 'Erreur : La date d''utilisation doit être comprise entre la date de début et la date de fin du projet.');
+    WHEN e_nb_heures_invalide THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Erreur : Le nombre d''heures d''utilisation doit être compris entre 0 et 24.');
+    WHEN e_budget_depasse THEN
+        RAISE_APPLICATION_ERROR(-20003, 'Erreur : Le coût total du projet ne doit pas dépasser le budget.');
+    WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR(-20004, 'Erreur inconnue : ' || SQLERRM);
+END;
+/
+
+-- Trigger après mise à jour ou suppression dans la table 'Utiliser' (n°3, n°5)
+-- Actions :
+-- Mettre à jour le coût matériel du projet
+CREATE OR REPLACE TRIGGER UtiliserUpdate
+AFTER UPDATE OR DELETE ON Utiliser
+DECLARE
+    v_new_cout NUMBER(10,2);
+BEGIN
+    -- On met à jour le cout matériel pour chaque projet
+    FOR r IN (SELECT DISTINCT IdProj 
+        FROM Utiliser
+    ) LOOP
+        SELECT NVL(SUM(CoutHoraire * NbHeures), 0) INTO v_new_cout
+        FROM Utiliser
+        WHERE IdProj = r.IdProj;
+        
+        -- On met à jour le coût matériel du projet
+        UPDATE Projet
+        SET CoutMat = v_new_cout
+        WHERE IdProj = r.IdProj;
+
+        -- On met à jour le nombre d'heures d'utilisation du matériel
+        UPDATE Materiel
+        SET NbHeurUtilisation = (SELECT SUM(NbHeures) FROM Utiliser WHERE CodeMat = Materiel.CodeMat)
+        WHERE CodeMat IN (SELECT CodeMat FROM Utiliser WHERE IdProj = r.IdProj);
+    END LOOP;
+END;
+/
